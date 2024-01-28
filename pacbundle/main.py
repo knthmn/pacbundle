@@ -1,4 +1,5 @@
 import re
+import shlex
 import subprocess
 from collections import Counter
 from functools import cached_property, lru_cache
@@ -12,9 +13,11 @@ from rich import print
 from rich.columns import Columns
 from rich.console import Console
 from rich.table import Table
+from typing_extensions import Annotated
 
 app = typer.Typer()
 console = Console()
+state = {"verbose": False, "dry_run": False}
 
 APP_NAME = "pacbundle"
 
@@ -39,8 +42,13 @@ class Bundle(BaseModel):
         )
 
 
+class Settings(BaseModel):
+    install_command: str = "sudo pacman -S"
+
+
 class Config(BaseModel):
     bundles: dict[str, Bundle] = Field(default_factory=dict)
+    settings: Settings = Field(default=Settings())
 
 
 def identifier_type(identifier: str):
@@ -51,6 +59,7 @@ def identifier_type(identifier: str):
     return "package"
 
 
+@lru_cache(1)
 def read_config() -> Config:
     config_file = Path(typer.get_app_dir(APP_NAME)) / "config.toml"
     try:
@@ -76,6 +85,13 @@ def pacman(*args: str) -> list[str]:
     return [line for line in output if line]
 
 
+def run_action(*args: str) -> None:
+    if state["dry_run"] or state["verbose"]:
+        print(f"Running command: [italic]{shlex.join(args)}[/italic]")
+    if not state["dry_run"]:
+        subprocess.run(args, check=True)
+
+
 @lru_cache(1)
 def pacman_groups() -> dict[str, set[str]]:
     group_output = pacman("-Qg")
@@ -91,6 +107,32 @@ def pacman_groups() -> dict[str, set[str]]:
 @lru_cache(1)
 def get_explicitly_installed_packages() -> set[str]:
     return set(line.split(" ")[0] for line in pacman("-Qe"))
+
+
+@lru_cache(1)
+def get_installed_packages() -> set[str]:
+    return set(line.split(" ")[0] for line in pacman("-Q"))
+
+
+def install_or_mark_explicit(packages: Iterable[str]):
+    config = read_config()
+    packages_to_install_or_mark_explicit = (
+        set(packages) - get_explicitly_installed_packages()
+    )
+    packages_to_install = (
+        packages_to_install_or_mark_explicit - get_installed_packages()
+    )
+    packages_to_mark_explicit = (
+        packages_to_install_or_mark_explicit & get_installed_packages()
+    )
+    if packages_to_install:
+        run_action(*config.settings.install_command.split(" "), *packages_to_install)
+    if packages_to_mark_explicit:
+        run_action("sudo", "pacman", "-D", "--asexplicit", *packages_to_mark_explicit)
+
+
+def mark_as_dependency(packages: Iterable[str]):
+    run_action("sudo", "pacman", "-D", "--asdeps", *packages)
 
 
 def expand_bundles(bundle_names_to_search: Iterable[str], config: Config) -> set[str]:
@@ -126,6 +168,37 @@ def get_packages(bundle: Bundle) -> list[str]:
             case "package":
                 packages.append(member)
     return packages
+
+
+def confirm_action(prompt: str = "Proceed with action?"):
+    if state["no_confirm"]:
+        return
+    typer.confirm(prompt, abort=True)
+
+
+def get_all_specified_packages():
+    config = read_config()
+    specified_bundle_names = {
+        name for name, bundle in config.bundles.items() if bundle.is_included
+    }
+    all_bundle_names = expand_bundles(specified_bundle_names, config)
+    all_packages = {
+        package
+        for bundle_name in all_bundle_names
+        for package in get_packages(config.bundles[bundle_name])
+    }
+    return all_packages
+
+
+@app.callback()
+def main(
+    verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False,
+    dry_run: Annotated[bool, typer.Option("--dry-run", "-n")] = False,
+    no_confirm: Annotated[bool, typer.Option("--no-confirm")] = False,
+):
+    state["verbose"] = verbose
+    state["dry_run"] = dry_run
+    state["no_confirm"] = no_confirm
 
 
 @app.command("list", help="List the bundles in the configuration file.")
@@ -165,17 +238,7 @@ def list_packages():
     help="Compare the difference between of packages in included bundles and those installed in the system.",
 )
 def compare_packages_difference():
-    config = read_config()
-    specified_bundle_names = {
-        name for name, bundle in config.bundles.items() if bundle.is_included
-    }
-    all_bundle_names = expand_bundles(specified_bundle_names, config)
-    all_packages = {
-        package
-        for bundle_name in all_bundle_names
-        for package in get_packages(config.bundles[bundle_name])
-    }
-
+    all_packages = get_all_specified_packages()
     installed_packages = get_explicitly_installed_packages()
     installed_but_not_specified = installed_packages - all_packages
     if installed_but_not_specified:
@@ -191,3 +254,61 @@ def compare_packages_difference():
         print(Columns(specified_but_not_installed, equal=True, expand=True))
     if installed_but_not_specified or specified_but_not_installed:
         raise typer.Exit(10)
+
+
+@app.command("sync", help="Sync system installation with included bundles")
+def sync_packages():
+    all_packages = get_all_specified_packages()
+    installed_packages = get_explicitly_installed_packages()
+    installed_but_not_specified = installed_packages - all_packages
+    specified_but_not_installed = all_packages - installed_packages
+
+    if installed_but_not_specified:
+        print(
+            f"The following {len(installed_but_not_specified)} packages will be unmarked as explicitly installed."
+        )
+        print(Columns(installed_but_not_specified, equal=True, expand=True))
+    specified_but_not_installed = all_packages - installed_packages
+    if specified_but_not_installed:
+        print(
+            f"The following {len(specified_but_not_installed)} packages will be installed"
+        )
+        print(Columns(specified_but_not_installed, equal=True, expand=True))
+    if not installed_but_not_specified and not specified_but_not_installed:
+        print("Nothing to do")
+        raise typer.Exit()
+    confirm_action()
+    if installed_but_not_specified:
+        mark_as_dependency(installed_but_not_specified)
+        print(
+            "Remember to run [italic]pacman -Rsn $(pacman -Qdtq) to clean up unused dependencies[/italic]"
+        )
+    if specified_but_not_installed:
+        install_or_mark_explicit(specified_but_not_installed)
+
+
+@app.command("install", help="Install a bundle")
+def install_bundle(name: Annotated[str, typer.Argument(help="Name of the bundle")]):
+    config = read_config()
+    if name not in config.bundles:
+        print(f"[red]Bundle {name} does not exist in config.[/red]")
+        raise typer.Exit(1)
+    all_bundle_names = expand_bundles([name], config)
+    all_packages = {
+        package
+        for bundle_name in all_bundle_names
+        for package in get_packages(config.bundles[bundle_name])
+    }
+    packages_to_install_or_mark_explicit = (
+        all_packages - get_explicitly_installed_packages()
+    )
+    if not packages_to_install_or_mark_explicit:
+        print("All packages in the bundle is already installed.")
+        raise typer.Exit(0)
+
+    print(
+        "[bold]The following packages will be installed or mark as explicitly installed.[/bold]"
+    )
+    print(Columns(packages_to_install_or_mark_explicit))
+    confirm_action()
+    install_or_mark_explicit(all_packages)
