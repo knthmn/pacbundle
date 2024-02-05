@@ -1,3 +1,4 @@
+import os
 import re
 import shlex
 import subprocess
@@ -59,11 +60,13 @@ def identifier_type(identifier: str):
     return "package"
 
 
+config_path = Path(typer.get_app_dir(APP_NAME)) / "config.toml"
+
+
 @lru_cache(1)
 def read_config() -> Config:
-    config_file = Path(typer.get_app_dir(APP_NAME)) / "config.toml"
     try:
-        with open(config_file, "rb") as f:
+        with open(config_path, "rb") as f:
             data = tomllib.load(f)
             return Config.model_validate(data)
     except FileNotFoundError:
@@ -312,3 +315,20 @@ def install_bundle(name: Annotated[str, typer.Argument(help="Name of the bundle"
     print(Columns(packages_to_install_or_mark_explicit))
     confirm_action()
     install_or_mark_explicit(all_packages)
+
+
+@app.command("config", help="Edit the config file")
+def edit_config():
+    if not config_path.is_file():
+        print("Creating file")
+        try:
+            with open(config_path, "w"):
+                pass
+        except Exception as e:
+            print(f"[red]Failed to create config file:[/red]\n{e}")
+            raise typer.Exit(1)
+    editor = os.getenv("EDITOR")
+    if not editor:
+        print("[red]$EDITOR is not set[/red]")
+        raise typer.Exit(1)
+    subprocess.call([*editor.split(" "), config_path])
