@@ -1,3 +1,5 @@
+#!/usr/bin/env python
+
 import os
 import re
 import shlex
@@ -332,3 +334,7 @@ def edit_config():
         print("[red]$EDITOR is not set[/red]")
         raise typer.Exit(1)
     subprocess.call([*editor.split(" "), config_path])
+
+
+if __name__ == "__main__":
+    app()

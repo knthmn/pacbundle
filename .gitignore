@@ -1,2 +1,6 @@
 __pycache__
 /.vscode
+/*.tar.gz
+/*.pkg.tar.zst
+/pkg/
+/src/
