@@ -5,7 +5,7 @@ import subprocess
 from collections import Counter
 from functools import cached_property, lru_cache
 from pathlib import Path
-from typing import Iterable
+from typing import ClassVar, Iterable
 
 import tomllib
 import typer
@@ -23,24 +23,68 @@ state = {"verbose": False, "dry_run": False}
 APP_NAME = "pacbundle"
 
 
+class AbstractIdentifier(BaseModel):
+    condition: str | None = None
+
+    @property
+    def is_passing_condition(self):
+        return self.condition is None or check_condition(self.condition)
+
+
+class PackageIdentifier(AbstractIdentifier):
+    package: str
+    identifier_type: ClassVar[str] = "package"
+
+
+class GroupIdentifier(AbstractIdentifier):
+    group: str
+    identifier_type: ClassVar[str] = "group"
+
+
+class BundleIdentifier(AbstractIdentifier):
+    bundle: str
+    identifier_type: ClassVar[str] = "bundle"
+
+
+Identifier = PackageIdentifier | GroupIdentifier | BundleIdentifier
+
+
 class Bundle(BaseModel):
-    members: list[str]
+    members: list[str | Identifier]
     include: str | None = None
 
     @field_validator("members")
-    def members_are_valid_identifiers(cls, members: list[str]):
+    def members_are_valid_identifiers(cls, members: list[str | Identifier]):
         for member in members:
+            if not isinstance(member, str):
+                continue
             pattern = R"^(g#|#)?[\w@.+-]+$"
             if not re.match(pattern, member):
                 raise ValueError(f"Invalid identifier: {member}")
         return members
 
     @cached_property
+    def normalized_members(self):
+        members: list[Identifier] = []
+        for member in self.members:
+            if isinstance(member, Identifier):
+                members.append(member)
+            elif member.startswith("g#"):
+                members.append(GroupIdentifier(group=member[2:]))
+            elif member.startswith("#"):
+                members.append(BundleIdentifier(bundle=member[1:]))
+            else:
+                members.append(PackageIdentifier(package=member))
+        return members
+
+    @property
     def is_included(self):
-        return (
-            self.include is not None
-            and subprocess.run(self.include, shell=True, check=False).returncode == 0
-        )
+        return self.include is not None and check_condition(self.include)
+
+
+@lru_cache
+def check_condition(condition: str):
+    return subprocess.run(condition, shell=True, check=False).returncode == 0
 
 
 class Settings(BaseModel):
@@ -50,14 +94,6 @@ class Settings(BaseModel):
 class Config(BaseModel):
     bundles: dict[str, Bundle] = Field(default_factory=dict)
     settings: Settings = Field(default=Settings())
-
-
-def identifier_type(identifier: str):
-    if identifier.startswith("#"):
-        return "bundle"
-    if identifier.startswith("g#"):
-        return "group"
-    return "package"
 
 
 app_dir = Path(typer.get_app_dir(APP_NAME))
@@ -151,26 +187,25 @@ def expand_bundles(bundle_names_to_search: Iterable[str], config: Config) -> set
             raise typer.Exit(1)
         bundle_names.add(bundle_name)
         bundle = config.bundles[bundle_name]
-        for member in bundle.members:
-            if identifier_type(member) == "bundle":
-                bundle_names_to_search.append(member[1:])
+        for member in bundle.normalized_members:
+            if isinstance(member, BundleIdentifier) and member.is_passing_condition:
+                bundle_names_to_search.append(member.bundle)
     return bundle_names
 
 
 def get_packages(bundle: Bundle) -> list[str]:
     packages: list[str] = []
-    for member in bundle.members:
-        match identifier_type(member):
-            case "group":
-                group_name = member[2:]
-                if group_name not in pacman_groups():
-                    print(
-                        f"[red]There is no bundle called [bold]{group_name}[/bold][/red]"
-                    )
-                    typer.Exit(1)
-                packages.extend(pacman_groups()[group_name])
-            case "package":
-                packages.append(member)
+    for member in bundle.normalized_members:
+        if not member.is_passing_condition:
+            continue
+        if isinstance(member, GroupIdentifier):
+            group_name = member.group
+            if group_name not in pacman_groups():
+                print(f"[red]There is no bundle called [bold]{group_name}[/bold][/red]")
+                typer.Exit(1)
+            packages.extend(pacman_groups()[group_name])
+        elif isinstance(member, PackageIdentifier):
+            packages.append(member.package)
     return packages
 
 
@@ -215,11 +250,13 @@ def list_packages():
     table = Table("Bundle", "Child Bundles", "Packages", "Included")
     for bundle_name, bundle in config.bundles.items():
         child_bundles = (
-            member[1:]
+            member.bundle
             for member in bundle.members
-            if identifier_type(member) == "bundle"
+            if isinstance(member, BundleIdentifier)
         )
-        packages_count = Counter(identifier_type(member) for member in bundle.members)
+        packages_count = Counter(
+            member.identifier_type for member in bundle.normalized_members
+        )
         packages_count_str = f"{packages_count['package']} packages"
         if packages_count["group"]:
             packages_count_str += f"\n{packages_count['group']} groups"
@@ -227,11 +264,13 @@ def list_packages():
             bundle_name,
             ", ".join(child_bundles),
             packages_count_str,
-            "✓"
-            if bundle.is_included
-            else "○"
-            if bundle_name in all_bundle_names
-            else "✖",
+            (
+                "✓"
+                if bundle.is_included
+                else "○"
+                if bundle_name in all_bundle_names
+                else "✖"
+            ),
         )
     print("✓: directly included, ○: transitively included, ✖: not included")
     console.print(table)
